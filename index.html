@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Directed Network Graph</title>
+    <style>
+        /* Basic styling to make the canvas fill the page */
+        body {
+            margin: 0;
+            overflow: hidden; /* Hide scrollbars */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: #f0f0f0; /* Light background */
+            font-family: 'Inter', sans-serif; /* Using Inter font */
+        }
+        canvas {
+            display: block; /* Remove extra space below canvas */
+            background-color: #ffffff; /* White background for the graph area */
+            border-radius: 10px; /* Rounded corners for the canvas */
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); /* Subtle shadow */
+            width: 100vw; /* Make canvas fill viewport width */
+            height: 100vh; /* Make canvas fill viewport height */
+        }
+        #loading-message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 1.5em;
+            color: #555;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading-message">Loading graph...</div>
+    <canvas id="networkGraphCanvas"></canvas>
+
+    <script>
+        // Get the canvas element and its 2D rendering context
+        const canvas = document.getElementById('networkGraphCanvas');
+        const ctx = canvas.getContext('2d');
+        const loadingMessage = document.getElementById('loading-message');
+
+        let graph; // Global graph object
+        let isDragging = false; // True if a node is being dragged
+        let draggedNode = null; // The node currently being dragged
+        let offsetX, offsetY; // Offset for dragging (mouse position relative to node center in world coords)
+
+        let isPanning = false; // True if the background is being panned
+        let panStartX, panStartY; // Starting mouse position for panning (screen coords)
+
+        let animationFrameId; // To store the requestAnimationFrame ID for stopping/starting
+
+        // Viewport transformation state
+        const viewOffset = { x: 0, y: 0, scale: 1.0 }; // x, y are translation, scale is zoom level
+
+        let selectedNode = null; // The node currently selected/clicked for highlighting
+
+        // --- Graph Data Structure ---
+        // Represents a node in the graph
+        class Node {
+            constructor(name, ability, trigger, weight) {
+                this.name = name;
+                this.ability = ability;
+                this.trigger = trigger;
+                this.weight = parseInt(weight) || 0; // Ensure weight is a number, default to 0 if invalid
+
+                // Initial random position for layout algorithm (world coordinates)
+                this.x = Math.random() * canvas.width;
+                this.y = Math.random() * canvas.height;
+                this.dx = 0; // Displacement in x for force-directed layout
+                this.dy = 0; // Displacement in y for force-directed layout
+                this.radius = 20; // Default node radius (in world units)
+                this.color = this.getSaturatedColor(); // Calculate color based on weight
+            }
+
+            // Calculates HSL color based on weight value for saturation
+            getSaturatedColor() {
+                const minWeight = 1;
+                const maxWeight = 30;
+                const minSaturation = 10; // % saturation for weight = 1
+                const maxSaturation = 100; // % saturation for weight = 50
+                const baseHue = 200; // Degrees (for a blueish color)
+                const baseLightness = 50; // % lightness
+
+                // Clamp weight within the 1-50 range for consistent scaling
+                const clampedWeight = Math.max(minWeight, Math.min(this.weight, maxWeight));
+
+                // Calculate saturation: linear interpolation between min and max saturation
+                const saturation = minSaturation + (maxSaturation - minSaturation) * ((clampedWeight - minWeight) / (maxWeight - minWeight));
+
+                return `hsl(${baseHue}, ${saturation}%, ${baseLightness}%)`;
+            }
+        }
+
+        // Represents the entire graph
+        class Graph {
+            constructor() {
+                this.nodes = {}; // Stores nodes by their name: { nodeName: NodeObject }
+                this.edges = []; // Stores edges as objects: [{ source: NodeNameA, target: NodeNameB }]
+                // Adjacency list for quick lookup of incoming/outgoing nodes
+                this.adj = {}; // { nodeName: { incoming: Set<string>, outgoing: Set<string> } }
+            }
+
+            // Adds a new node to the graph
+            addNode(name, ability, trigger, weight) {
+                if (!this.nodes[name]) {
+                    this.nodes[name] = new Node(name, ability, trigger, weight);
+                    this.adj[name] = { incoming: new Set(), outgoing: new Set() };
+                }
+            }
+
+            // Adds a directed edge between two nodes and updates adjacency lists
+            addEdge(sourceName, targetName) {
+                if (this.nodes[sourceName] && this.nodes[targetName]) {
+                    this.edges.push({ source: sourceName, target: targetName });
+                    this.adj[sourceName].outgoing.add(targetName);
+                    this.adj[targetName].incoming.add(sourceName);
+                }
+            }
+        }
+
+        // --- CSV Parsing Function ---
+        // Parses CSV text into an array of row objects
+        async function parseCSV(csvText) {
+            const lines = csvText.trim().split('\n');
+            if (lines.length === 0) return [];
+
+            // Extract headers from the first line, converting to lowercase
+            const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+            const data = [];
+
+            // Process each subsequent line as a data row
+            for (let i = 1; i < lines.length; i++) {
+                const values = lines[i].split(',').map(v => v.trim());
+                const row = {};
+                // Map values to lowercase headers
+                headers.forEach((header, index) => {
+                    row[header] = values[index] || ''; // Use empty string for missing values
+                });
+                data.push(row);
+            }
+            return data;
+        }
+
+        // --- Physics Simulation Step ---
+        // Adjusts node positions based on repulsive and attractive forces for one step
+        function updatePhysics(graph, repulsionStrength = 15000, attractionStrength = 0.01, idealLength = 180, damping = 0.9) {
+            const nodesArray = Object.values(graph.nodes);
+            const worldWidth = canvas.width;  // Physics operates in a fixed world size
+            const worldHeight = canvas.height;
+
+            // Reset forces for each node, unless it's being dragged
+            nodesArray.forEach(node => {
+                if (node !== draggedNode) {
+                    node.dx = 0;
+                    node.dy = 0;
+                }
+            });
+
+            // Calculate repulsion forces between all pairs of nodes
+            for (let j = 0; j < nodesArray.length; j++) {
+                for (let k = j + 1; k < nodesArray.length; k++) {
+                    const node1 = nodesArray[j];
+                    const node2 = nodesArray[k];
+
+                    const dx = node2.x - node1.x;
+                    const dy = node2.y - node1.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+
+                    if (dist > 0) {
+                        const force = repulsionStrength / (dist * dist); // Inverse square law for repulsion
+                        const fx = force * dx / dist;
+                        const fy = force * dy / dist;
+
+                        if (node1 !== draggedNode) {
+                            node1.dx -= fx;
+                            node1.dy -= fy;
+                        }
+                        if (node2 !== draggedNode) {
+                            node2.dx += fx;
+                            node2.dy += fy;
+                        }
+                    }
+                }
+            }
+
+            // Calculate attraction forces along edges (spring-like)
+            graph.edges.forEach(edge => {
+                const node1 = graph.nodes[edge.source];
+                const node2 = graph.nodes[edge.target];
+
+                if (!node1 || !node2) return; // Skip if node not found
+
+                const dx = node2.x - node1.x;
+                const dy = node2.y - node1.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+
+                if (dist > 0) {
+                    const force = attractionStrength * (dist - idealLength); // Force proportional to deviation from ideal length
+                    const fx = force * dx / dist;
+                    const fy = force * dy / dist;
+
+                    if (node1 !== draggedNode) {
+                        node1.dx += fx;
+                        node1.dy += fy;
+                    }
+                    if (node2 !== draggedNode) {
+                        node2.dx -= fx;
+                        node2.dy -= fy;
+                    }
+                }
+            });
+
+            // Update node positions and apply damping
+            nodesArray.forEach(node => {
+                if (node !== draggedNode) { // Only apply physics to non-dragged nodes
+                    node.x += node.dx * damping;
+                    node.y += node.dy * damping;
+
+                    // Keep nodes within world boundaries
+                    node.x = Math.max(node.radius, Math.min(node.x, worldWidth - node.radius));
+                    node.y = Math.max(node.radius, Math.min(node.y, worldHeight - node.radius));
+                }
+            });
+        }
+
+        // --- Drawing Functions ---
+        // Draws the entire graph on the canvas
+        function drawGraph(graph) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height); // Clear the entire canvas
+
+            ctx.save(); // Save the untransformed state of the canvas
+
+            // Apply view transformations (pan and zoom)
+            ctx.translate(viewOffset.x, viewOffset.y);
+            ctx.scale(viewOffset.scale, viewOffset.scale);
+
+            // Draw edges first
+            graph.edges.forEach(edge => {
+                const sourceNode = graph.nodes[edge.source];
+                const targetNode = graph.nodes[edge.target];
+
+                if (!sourceNode || !targetNode) return;
+
+                let edgeColor = '#8888'; // Default gray
+                let edgeWidth = 2 / viewOffset.scale;
+                let arrowColor = '#8888';
+
+                if (selectedNode) {
+                    if (edge.source === selectedNode.name) { // Outgoing edge from selected node
+                        edgeColor = '#f008';
+                        edgeWidth = 4 / viewOffset.scale;
+                        arrowColor = '#f008';
+                    } else if (edge.target === selectedNode.name) { // Incoming edge to selected node
+                        edgeColor = '#0a08';
+                        edgeWidth = 4 / viewOffset.scale;
+                        arrowColor = '#0a08';
+                    }
+                }
+
+                ctx.strokeStyle = edgeColor;
+                ctx.lineWidth = edgeWidth;
+                ctx.beginPath();
+                ctx.moveTo(sourceNode.x, sourceNode.y);
+                ctx.lineTo(targetNode.x, targetNode.y);
+                ctx.stroke();
+
+                // Draw arrowhead (simple triangle)
+                const angle = Math.atan2(targetNode.y - sourceNode.y, targetNode.x - sourceNode.x);
+                const arrowLength = 15 / viewOffset.scale;
+                const arrowWidth = 8 / viewOffset.scale;
+
+                ctx.save(); // Save current canvas state for arrowhead
+                ctx.translate(targetNode.x, targetNode.y); // Move origin to target node
+                ctx.rotate(angle); // Rotate to align with edge
+                
+                ctx.beginPath();
+                // Position arrowhead slightly before the target node's edge (scaled radius)
+                ctx.moveTo(-targetNode.radius, 0); 
+                ctx.lineTo(-targetNode.radius - arrowLength, arrowWidth / 2);
+                ctx.lineTo(-targetNode.radius - arrowLength, -arrowWidth / 2);
+                ctx.closePath();
+                ctx.fillStyle = arrowColor; // Fill arrowhead with determined color
+                ctx.fill();
+                ctx.restore(); // Restore canvas state after arrowhead drawing
+            });
+
+            // Draw nodes and their labels
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            Object.values(graph.nodes).forEach(node => {
+                let nodeFillColor = node.color; // Default from weight saturation
+                let nodeStrokeColor = '#4682B4'; // Default dark blue border
+                let nodeStrokeWidth = 2 / viewOffset.scale;
+                let weightFont = `bold ${12 / viewOffset.scale}px Arial`;
+                let nameFont = `bold ${14 / viewOffset.scale}px Arial`;
+
+                if (selectedNode) {
+                    if (node === selectedNode) {
+                        nodeFillColor = node.color; // Keep original fill
+                        nodeStrokeColor = 'yellow';
+                        nodeStrokeWidth = 4 / viewOffset.scale;
+                    } else if (graph.adj[selectedNode.name].outgoing.has(node.name)) { // Node is an outgoing neighbor
+                        nodeFillColor = node.color; // Keep original fill
+                        nodeStrokeColor = 'red';
+                        nodeStrokeWidth = 4 / viewOffset.scale;
+                    } else if (graph.adj[selectedNode.name].incoming.has(node.name)) { // Node is an incoming neighbor
+                        nodeFillColor = node.color; // Keep original fill
+                        nodeStrokeColor = 'green';
+                        nodeStrokeWidth = 4 / viewOffset.scale;
+                    }
+                }
+
+                // Draw node circle
+                ctx.beginPath();
+                ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
+                ctx.fillStyle = nodeFillColor;
+                ctx.fill();
+                ctx.strokeStyle = nodeStrokeColor;
+                ctx.lineWidth = nodeStrokeWidth;
+                ctx.stroke();
+
+                // Draw weight number
+                ctx.font = weightFont;
+                ctx.fillStyle = 'black';
+                ctx.fillText(node.weight, node.x, node.y - node.radius / 2.5);
+
+                // Draw node name
+                ctx.font = nameFont;
+                ctx.fillStyle = 'black';
+                ctx.fillText(node.name, node.x, node.y + node.radius / 4);
+
+                // Draw node name
+                ctx.font = nameFont;
+                ctx.fillStyle = 'black';
+                ctx.fillText(node.trigger, node.x, node.y + 1.75 * node.radius / 2);
+
+                // Draw node name
+                ctx.font = nameFont;
+                ctx.fillStyle = 'black';
+                ctx.fillText(node.ability, node.x, node.y + 3 * node.radius / 2);
+            });
+
+            ctx.restore(); // Restore the canvas to its original untransformed state
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            if (graph) { // Ensure graph is loaded before updating physics and drawing
+                updatePhysics(graph);
+                drawGraph(graph);
+            }
+            animationFrameId = requestAnimationFrame(animate); // Continue the loop
+        }
+
+        // --- Helper: Convert Screen Coordinates to World Coordinates ---
+        function screenToWorld(screenX, screenY) {
+            return {
+                x: (screenX - viewOffset.x) / viewOffset.scale,
+                y: (screenY - viewOffset.y) / viewOffset.scale
+            };
+        }
+
+        // --- Event Handlers for Interaction ---
+        canvas.addEventListener('mousedown', (e) => {
+            const worldMouse = screenToWorld(e.clientX, e.clientY);
+
+            // Check if mouse is over any node
+            draggedNode = null; // Reset dragged node
+            selectedNode = null; // Reset selected node on new click
+            for (const node of Object.values(graph.nodes)) {
+                const dist = Math.sqrt(Math.pow(worldMouse.x - node.x, 2) + Math.pow(worldMouse.y - node.y, 2));
+                if (dist < node.radius) {
+                    isDragging = true;
+                    draggedNode = node;
+                    selectedNode = node; // Select this node when clicked
+                    offsetX = worldMouse.x - node.x; // Offset in world coordinates
+                    offsetY = worldMouse.y - node.y; // Offset in world coordinates
+                    canvas.style.cursor = 'grabbing'; // Change cursor
+                    return; // Node found, stop checking for panning
+                }
+            }
+
+            // If no node was clicked, start panning
+            isPanning = true;
+            panStartX = e.clientX; // Store screen coordinates for panning
+            panStartY = e.clientY;
+            canvas.style.cursor = 'grabbing'; // Change cursor for panning
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (isDragging && draggedNode) {
+                const worldMouse = screenToWorld(e.clientX, e.clientY);
+                draggedNode.x = worldMouse.x - offsetX;
+                draggedNode.y = worldMouse.y - offsetY;
+
+                // Keep dragged node within world boundaries
+                draggedNode.x = Math.max(draggedNode.radius, Math.min(draggedNode.x, canvas.width - draggedNode.radius));
+                draggedNode.y = Math.max(draggedNode.radius, Math.min(draggedNode.y, canvas.height - draggedNode.radius));
+            } else if (isPanning) {
+                const dx = e.clientX - panStartX;
+                const dy = e.clientY - panStartY;
+                viewOffset.x += dx;
+                viewOffset.y += dy;
+                panStartX = e.clientX; // Update for next move
+                panStartY = e.clientY; // Update for next move
+            }
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            isDragging = false;
+            draggedNode = null;
+            isPanning = false;
+            canvas.style.cursor = 'grab'; // Reset cursor
+        });
+
+        canvas.addEventListener('mouseout', () => {
+            // Stop dragging/panning if mouse leaves the canvas area
+            isDragging = false;
+            draggedNode = null;
+            isPanning = false;
+            canvas.style.cursor = 'grab'; // Reset cursor
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault(); // Prevent page scrolling
+
+            const scaleAmount = 1.1; // How much to zoom in/out per scroll tick
+            const mouseX = e.clientX; // Mouse position on screen
+            const mouseY = e.clientY;
+
+            // Calculate world coordinates of the mouse before zooming
+            const worldXBeforeZoom = screenToWorld(mouseX, mouseY).x;
+            const worldYBeforeZoom = screenToWorld(mouseX, mouseY).y;
+
+            // Determine new scale
+            if (e.deltaY < 0) { // Scroll up = zoom in
+                viewOffset.scale *= scaleAmount;
+            } else { // Scroll down = zoom out
+                viewOffset.scale /= scaleAmount;
+            }
+
+            // Clamp scale to reasonable limits
+            viewOffset.scale = Math.max(0.1, Math.min(viewOffset.scale, 5.0)); // Min 0.1x, Max 5x zoom
+
+            // Calculate new world coordinates of the mouse after applying the new scale
+            // This is needed because viewOffset.x and y are in screen space, but they need to shift
+            // to keep the world point under the mouse stationary.
+            const worldXAfterZoom = (mouseX - viewOffset.x) / viewOffset.scale;
+            const worldYAfterZoom = (mouseY - viewOffset.y) / viewOffset.scale;
+
+            // Adjust viewOffset to keep the point under the mouse stationary
+            viewOffset.x += (worldXAfterZoom - worldXBeforeZoom) * viewOffset.scale;
+            viewOffset.y += (worldYAfterZoom - worldYBeforeZoom) * viewOffset.scale;
+        });
+
+
+        // --- Main Execution Flow ---
+        async function initGraph() {
+            // Set canvas dimensions to fill the window
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            canvas.style.cursor = 'grab'; // Default cursor for draggable elements
+
+            // Reset view offset on re-initialization (e.g., resize)
+            viewOffset.x = 0;
+            viewOffset.y = 0;
+            viewOffset.scale = 1.0;
+            selectedNode = null; // Reset selected node on re-initialization
+
+            loadingMessage.style.display = 'block'; // Show loading message
+
+            graph = new Graph(); // Initialize global graph object
+            const csvFilePath = 'https://arborius.online/card/arborius.csv'; // Updated CSV path
+
+            try {
+                const response = await fetch(csvFilePath);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const csvText = await response.text();
+                const csvData = await parseCSV(csvText);
+
+                if (csvData.length === 0) {
+                    loadingMessage.textContent = "Error: CSV file is empty or invalid.";
+                    console.error("CSV file is empty or invalid.");
+                    return;
+                }
+
+                // Validate required columns (now expecting lowercase)
+                const headers = Object.keys(csvData[0]);
+                const nodeNameCol = headers[0]; // First column is node name
+                if (!headers.includes('ability') || !headers.includes('trigger') || !headers.includes('weight')) {
+                    loadingMessage.textContent = `Error: CSV must contain '${nodeNameCol}', 'ability', 'trigger', and 'weight' columns.`;
+                    console.error("CSV must contain 'ability', 'trigger', and 'weight' columns.");
+                    return;
+                }
+
+                // Add nodes
+                csvData.forEach(row => {
+                    const nodeName = String(row[nodeNameCol]);
+                    const ability = String(row['ability'] || '');
+                    const trigger = String(row['trigger'] || '');
+                    const weight = String(row['weight'] || '0'); // Get weight value
+                    graph.addNode(nodeName, ability, trigger, weight);
+                });
+
+                // Add edges
+                const nodesArray = Object.values(graph.nodes);
+                for (const nodeA of nodesArray) {
+                    for (const nodeB of nodesArray) {
+                        if (nodeA.name === nodeB.name) continue; // No self-loops
+
+                        // Check if B's trigger is present in A's ability
+                        if (nodeB.trigger && nodeA.ability.includes(nodeB.trigger)) {
+                            graph.addEdge(nodeA.name, nodeB.name);
+                        }
+                    }
+                }
+
+                // Start the animation loop after graph is loaded
+                if (animationFrameId) {
+                    cancelAnimationFrame(animationFrameId); // Cancel any previous animation frame
+                }
+                animate(); // Start continuous physics simulation and drawing
+
+                loadingMessage.style.display = 'none'; // Hide loading message
+            } catch (error) {
+                loadingMessage.textContent = `Failed to load or parse CSV: ${error.message}`;
+                console.error('Error:', error);
+            }
+        }
+
+        // Initialize graph when the DOM is fully loaded
+        document.addEventListener('DOMContentLoaded', initGraph);
+
+        // Redraw graph on window resize to adjust canvas dimensions
+        window.addEventListener('resize', () => {
+            // Stop current animation to prevent conflicts during resize
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+            }
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            // Re-initialize graph, which will restart the animation loop
+            initGraph(); 
+        });
+    </script>
+</body>
+</html>
